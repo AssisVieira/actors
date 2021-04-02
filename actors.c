@@ -261,14 +261,31 @@ typedef struct Worker {
   int throughput;
   int throughputDeadlineNS;
   Executor *executor;
+  int core;
 } Worker;
 
 void *worker_run(void *arg);
 
-Worker *worker_create(Executor *executor, int throughput, int throughputDeadlineNS) {
+int worker_set_core_affinity(int core) {
+  int numCores = sysconf(_SC_NPROCESSORS_ONLN);
+
+  if (core < 0 || core >= numCores)
+    return EINVAL;
+
+  cpu_set_t cpuset;
+  CPU_ZERO(&cpuset);
+  CPU_SET(core, &cpuset);
+
+  pthread_t currentThread = pthread_self();
+
+  return pthread_setaffinity_np(currentThread, sizeof(cpu_set_t), &cpuset);
+}
+
+Worker *worker_create(Executor *executor, int core, int throughput, int throughputDeadlineNS) {
   Worker *worker = malloc(sizeof(Worker));
   worker->executor = executor;
   worker->stop = false;
+  worker->core = core;
   worker->queue = queue_create(1000);
   worker->mutex = (pthread_mutex_t) PTHREAD_MUTEX_INITIALIZER;
   worker->condNotEmpty = (pthread_cond_t) PTHREAD_COND_INITIALIZER;
@@ -314,6 +331,10 @@ long worker_current_time_ns() {
 
 void *worker_run(void *arg) {
   Worker *worker =  (Worker *) arg;
+
+  if (worker_set_core_affinity(worker->core)) {
+    printf("[worker] set core affinity fail.\n");
+  }
 
   while (!worker->stop) {
     MailBox *mailbox = queue_get(worker->queue);
@@ -364,13 +385,15 @@ Executor *executor_create(int numWorkers) {
   Executor *executor = malloc(sizeof(Executor));
   executor->workers = malloc(sizeof(Worker *) * numWorkers);
   executor->numWorkers = numWorkers;
-  executor->currentWorker = -1;
+  executor->currentWorker = 0;
 
   int throughput = 5;
   int throughputDeadlineNS = -1; // not defined
 
+  int numCores = sysconf(_SC_NPROCESSORS_ONLN);
+
   for (int i = 0; i < numWorkers; i++) {
-    executor->workers[i] = worker_create(executor, throughput, throughputDeadlineNS);
+    executor->workers[i] = worker_create(executor, i % numCores, throughput, throughputDeadlineNS);
   }
 
   return executor;
@@ -549,7 +572,7 @@ int actorsystem_setup_signals() {
 
 void actorsystem_create() {
   ActorSystem *actorSystem = malloc(sizeof(ActorSystem));
-  actorSystem->executor = executor_create(10);
+  actorSystem->executor = executor_create(4);
   actorSystem->dispatcher = dispatcher_create(actorSystem->executor);
   actorSystem->stop = false;
 
@@ -614,6 +637,10 @@ typedef struct PingerState {
   int numPings;
 } PingerState;
 
+typedef struct PingerMsg {
+  int num;
+} PingerMsg;
+
 void pinger_on_start(Context *context) {
   PingerState *state = malloc(sizeof(PingerState));
   state->numPings = 0;
@@ -628,8 +655,9 @@ void pinger_on_start(Context *context) {
 void * pinger_on_receive(Context *context, Msg *msg) {
   PingerState *state = context->state;
   PingerParams *params = context->params;
+  PingerMsg *msgRecv = msg->payload;
 
-  printf("Ping %d\n", state->numPings);
+  printf("Ping %d\n", msgRecv->num);
 
   state->numPings++;
 
@@ -637,7 +665,12 @@ void * pinger_on_receive(Context *context, Msg *msg) {
     return NULL;
   }
 
-  actorsystem_sendme(context, "msg", 4);
+
+  {
+    PingerMsg msgToSend = { .num = state->numPings };
+    actorsystem_sendme(context, &msgToSend, sizeof(msgToSend));
+  }
+
 
   return pinger_on_receive;
 }
@@ -652,6 +685,7 @@ void pinger_on_stop(Context *context) {
 ////////////////////////////////////////////////////////////////////////////////
 
 int main() {
-  PingerParams params = {.maxPings = 10000};
+  PingerParams params = {.maxPings = 1000000};
   return actorsystem_main(&Pinger, &params, sizeof(PingerParams));
 }
+
