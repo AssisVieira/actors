@@ -67,7 +67,7 @@ typedef struct Queue {
   atomic_int writer;
   pthread_mutex_t writerMutex;
   int max;
-  void *items[];
+  void **items;
 } Queue;
 
 Queue *queue_create(int max) {
@@ -75,7 +75,8 @@ Queue *queue_create(int max) {
 
   if (max <= 0) return NULL;
 
-  queue = malloc(sizeof(Queue) + (sizeof(void *) * max));
+  queue = malloc(sizeof(Queue));
+  queue->items = malloc(sizeof(void *) * (max + 1));
 
   if (queue == NULL) {
     return NULL;
@@ -90,6 +91,7 @@ Queue *queue_create(int max) {
 }
 
 void queue_free(Queue *queue) {
+  free(queue->items);
   free(queue);
 }
 
@@ -161,6 +163,11 @@ MailBox *mailbox_create(int size) {
   mailbox->state = mailbox_process_start;
   mailbox->shouldProcessMessage = true;
   return mailbox;
+}
+
+void mailbox_free(MailBox *mailbox) {
+  queue_free(mailbox->queue);
+  free(mailbox);
 }
 
 bool mailbox_has_message(const MailBox *mailbox) {
@@ -237,10 +244,6 @@ bool mailbox_process(MailBox *mailbox) {
       mailbox->state == mailbox_process_empty) ? false : true;
 }
 
-void mailbox_free(MailBox *mailbox) {
-  queue_free(mailbox->queue);
-  free(mailbox);
-}
 
 ////////////////////////////////////////////////////////////////////////////////
 // Worker
@@ -275,6 +278,18 @@ Worker *worker_create(Executor *executor, int throughput, int throughputDeadline
   pthread_create(&worker->thread, NULL, worker_run, worker);
 
   return worker;  
+}
+
+void worker_free(Worker *worker) {
+  pthread_mutex_lock(&worker->mutex);
+  pthread_cond_signal(&worker->condNotEmpty);
+  pthread_mutex_unlock(&worker->mutex);
+
+  pthread_join(worker->thread, NULL);
+
+  queue_free(worker->queue);
+
+  free(worker);
 }
 
 void worker_enqueue(Worker *worker, MailBox *mailbox) {
@@ -333,18 +348,6 @@ void *worker_run(void *arg) {
 
 void worker_stop(Worker *worker) {
   worker->stop = true;
-}
-
-void worker_free(Worker *worker) {
-  pthread_mutex_lock(&worker->mutex);
-  pthread_cond_signal(&worker->condNotEmpty);
-  pthread_mutex_unlock(&worker->mutex);
-
-  pthread_join(worker->thread, NULL);
-
-  queue_free(worker->queue);
-
-  free(worker);
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -414,8 +417,6 @@ void dispatcher_free(Dispatcher *dispatcher) {
 }
 
 void dispatcher_register_for_execution(Dispatcher *dispatcher, MailBox *mailbox) {
-  printf("[dispatcher] trying register for execution: is idle? %d\n", 
-      mailbox_is_idle(mailbox));
   if (/*mailbox_has_message(mailbox) &&*/ mailbox_is_idle(mailbox)) {
     if (mailbox_set_scheduled(mailbox)) {
       executor_execute(dispatcher->executor, mailbox);
@@ -458,6 +459,7 @@ ActorCell *actorcell_create(const Actor *actor, const void *params, size_t size,
 }
 
 void actorcell_free(ActorCell *actorCell) {
+  free(actorCell->context.params);
   mailbox_free(actorCell->mailbox);
   free(actorCell);
 }
@@ -549,6 +551,7 @@ void actorsystem_create() {
   ActorSystem *actorSystem = malloc(sizeof(ActorSystem));
   actorSystem->executor = executor_create(10);
   actorSystem->dispatcher = dispatcher_create(actorSystem->executor);
+  actorSystem->stop = false;
 
   ACTOR_SYSTEM = actorSystem;
 
@@ -564,11 +567,13 @@ int actorsystem_main(const Actor *actor, const void *params, size_t size) {
 
   actorsystem_create();
 
-  actorsystem_actor_ref(actor, params, size);
+  ActorRef *mainActor = actorsystem_actor_ref(actor, params, size);
 
   while (!ACTOR_SYSTEM->stop) {
     sleep(1);
   }
+
+  actorref_free(mainActor);
 
   dispatcher_free(ACTOR_SYSTEM->dispatcher);
   executor_destroy(ACTOR_SYSTEM->executor);
@@ -624,7 +629,7 @@ void * pinger_on_receive(Context *context, Msg *msg) {
   PingerState *state = context->state;
   PingerParams *params = context->params;
 
-  printf("Ping\n");
+  printf("Ping %d\n", state->numPings);
 
   state->numPings++;
 
@@ -647,6 +652,6 @@ void pinger_on_stop(Context *context) {
 ////////////////////////////////////////////////////////////////////////////////
 
 int main() {
-  PingerParams params = {.maxPings = 10};
+  PingerParams params = {.maxPings = 10000};
   return actorsystem_main(&Pinger, &params, sizeof(PingerParams));
 }
