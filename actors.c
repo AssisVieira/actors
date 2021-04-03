@@ -144,6 +144,8 @@ typedef struct MailBox {
   Queue *queue;
   atomic_bool idle;
   void * (*state)(struct MailBox *mailbox);
+  bool affinity;
+  int worker;
 } MailBox;
 
 typedef enum MailBoxProcessResult {
@@ -155,13 +157,14 @@ typedef enum MailBoxProcessResult {
 void * mailbox_process_start(MailBox *mailbox);
 void * mailbox_process_next_message(MailBox *mailbox);
 
-MailBox *mailbox_create(int size) {
+MailBox *mailbox_create(int size, bool affinity) {
   MailBox *mailbox = malloc(sizeof(MailBox));
   mailbox->actorCell = NULL;
   mailbox->idle = true;
   mailbox->queue = queue_create(size);
   mailbox->state = mailbox_process_start;
   mailbox->shouldProcessMessage = true;
+  mailbox->affinity = affinity;
   return mailbox;
 }
 
@@ -411,14 +414,23 @@ void executor_destroy(Executor *executor) {
 }
 
 void executor_execute(Executor *executor, MailBox *mailbox) {
-  int currentWorker = executor->currentWorker;
-  int nextWorker = (currentWorker + 1) % executor->numWorkers;
+  int worker = mailbox->worker;
+  bool undefinedWorker = (worker < 0) ? true : false;
 
-  while (!atomic_compare_exchange_weak(&executor->currentWorker, &currentWorker, nextWorker)) {
-    nextWorker = (currentWorker + 1) % executor->numWorkers;
+  if (!mailbox->affinity || (mailbox->affinity && undefinedWorker)) {
+    int currentWorker = executor->currentWorker;
+    int nextWorker = (currentWorker + 1) % executor->numWorkers;
+
+    while (!atomic_compare_exchange_weak(&executor->currentWorker, &currentWorker, nextWorker)) {
+      nextWorker = (currentWorker + 1) % executor->numWorkers;
+    }
+
+    worker = nextWorker;
   }
 
-  worker_enqueue(executor->workers[nextWorker], mailbox);
+  mailbox->worker = worker;
+
+  worker_enqueue(executor->workers[worker], mailbox);
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -463,10 +475,10 @@ typedef struct ActorCell {
   Dispatcher *dispatcher;
 } ActorCell;
 
-ActorCell *actorcell_create(const Actor *actor, const void *params, size_t size, Dispatcher *dispatcher) {
+ActorCell *actorcell_create(const Actor *actor, const void *params, size_t size, Dispatcher *dispatcher, bool affinity) {
   ActorCell *actorCell = malloc(sizeof(ActorCell));
   actorCell->actor = *actor;
-  actorCell->mailbox = mailbox_create(1000);
+  actorCell->mailbox = mailbox_create(1000, affinity);
   actorCell->dispatcher = dispatcher;
   actorCell->context.state = NULL;
   actorCell->context.me = actorCell;
@@ -517,9 +529,9 @@ typedef struct ActorRef {
   ActorCell *actorCell;
 } ActorRef;
 
-ActorRef *actorref_create(const Actor *actor, const void *params, size_t size, Dispatcher *dispatcher) {
+ActorRef *actorref_create(const Actor *actor, const void *params, size_t size, Dispatcher *dispatcher, bool affinity) {
   ActorRef *actorRef = malloc(sizeof(ActorRef));
-  actorRef->actorCell = actorcell_create(actor, params, size, dispatcher);
+  actorRef->actorCell = actorcell_create(actor, params, size, dispatcher, affinity);
   return actorRef;
 }
 
@@ -570,9 +582,9 @@ int actorsystem_setup_signals() {
   return 0;
 }
 
-void actorsystem_create() {
+void actorsystem_create(int cores) {
   ActorSystem *actorSystem = malloc(sizeof(ActorSystem));
-  actorSystem->executor = executor_create(4);
+  actorSystem->executor = executor_create(cores);
   actorSystem->dispatcher = dispatcher_create(actorSystem->executor);
   actorSystem->stop = false;
 
@@ -581,16 +593,16 @@ void actorsystem_create() {
   actorsystem_setup_signals();
 }
 
-ActorRef *actorsystem_actor_ref(const Actor *actor, const void *params, size_t size) {
-  return actorref_create(actor, params, size, ACTOR_SYSTEM->dispatcher);
+ActorRef *actorsystem_actor_ref(const Actor *actor, const void *params, size_t size, bool affinity) {
+  return actorref_create(actor, params, size, ACTOR_SYSTEM->dispatcher, affinity);
 }
 
-int actorsystem_main(const Actor *actor, const void *params, size_t size) {
+int actorsystem_main(const Actor *actor, const void *params, size_t size, bool affinity, int cores) {
   printf("Starting actor system.\n");
 
-  actorsystem_create();
+  actorsystem_create(cores);
 
-  ActorRef *mainActor = actorsystem_actor_ref(actor, params, size);
+  ActorRef *mainActor = actorsystem_actor_ref(actor, params, size, affinity);
 
   while (!ACTOR_SYSTEM->stop) {
     sleep(1);
@@ -665,12 +677,8 @@ void * pinger_on_receive(Context *context, Msg *msg) {
     return NULL;
   }
 
-
-  {
-    PingerMsg msgToSend = { .num = state->numPings };
-    actorsystem_sendme(context, &msgToSend, sizeof(msgToSend));
-  }
-
+  PingerMsg msgToSend = { .num = state->numPings };
+  actorsystem_sendme(context, &msgToSend, sizeof(msgToSend));
 
   return pinger_on_receive;
 }
@@ -685,7 +693,7 @@ void pinger_on_stop(Context *context) {
 ////////////////////////////////////////////////////////////////////////////////
 
 int main() {
-  PingerParams params = {.maxPings = 1000000};
-  return actorsystem_main(&Pinger, &params, sizeof(PingerParams));
+  PingerParams params = {.maxPings = 10000};
+  return actorsystem_main(&Pinger, &params, sizeof(PingerParams), true, 4);
 }
 
