@@ -20,17 +20,22 @@
 // Msg
 ////////////////////////////////////////////////////////////////////////////////
 
-typedef struct Msg {
-  void *payload;
+typedef struct MsgType {
+  const char *name;
   size_t size;
+} MsgType;
+
+typedef struct Msg {
+  const MsgType *type;
+  void *payload;
 } Msg;
 
-Msg *msg_create(const void *payload, size_t size) {
+Msg *msg_create(const MsgType *type, const void *payload) {
   Msg *msg = malloc(sizeof(Msg));
-  msg->payload = malloc(size);
-  msg->size = size;
+  msg->payload = malloc(type->size);
+  msg->type = type;
 
-  memcpy(msg->payload, payload, size);
+  memcpy(msg->payload, payload, type->size);
 
   return msg;
 }
@@ -39,6 +44,8 @@ void msg_free(Msg *msg) {
   free(msg->payload);
   free(msg);
 }
+
+const MsgType Stop = { .name = "Stop", .size = 0, };
 
 ////////////////////////////////////////////////////////////////////////////////
 // Actor
@@ -222,7 +229,13 @@ void * mailbox_process_next_message(MailBox *mailbox) {
     return mailbox_process_empty;
   }
 
-  bool keepGoing = actorcell_receive(mailbox->actorCell, msg);
+  bool keepGoing = false;
+
+  if (msg->type == &Stop) {
+    keepGoing = false;
+  } else {
+    keepGoing = actorcell_receive(mailbox->actorCell, msg);
+  }
 
   msg_free(msg);
 
@@ -516,8 +529,8 @@ MailBox *actorcell_mailbox(ActorCell *actorCell) {
   return actorCell->mailbox;
 }
 
-void actorcell_send(ActorCell *actorCell, const void *payload, size_t size) {
-  Msg *msg = msg_create(payload, size);
+void actorcell_send(ActorCell *actorCell, const MsgType *type, const void *payload) {
+  Msg *msg = msg_create(type, payload);
   dispatcher_dispatch(actorCell->dispatcher, actorCell->mailbox, msg);
 }
 
@@ -540,8 +553,8 @@ void actorref_free(ActorRef *actorRef) {
   free(actorRef);
 }
 
-void actorref_send(ActorRef *actorRef, const void *payload, size_t size) {
-  actorcell_send(actorRef->actorCell, payload, size);
+void actorref_send(ActorRef *actorRef, const MsgType *type, const void *payload) {
+  actorcell_send(actorRef->actorCell, type, payload);
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -619,12 +632,12 @@ int actorsystem_main(const Actor *actor, const void *params, size_t size, bool a
   return 0;
 }
 
-void actorsystem_send(ActorRef *actorRef, const void *payload, size_t size) {
-  actorref_send(actorRef, payload, size);
+void actorsystem_send(ActorRef *actorRef, const MsgType *type, const void *payload) {
+  actorref_send(actorRef, type, payload);
 }
 
-void actorsystem_sendme(Context *context, const void *payload, size_t size) {
-  actorcell_send(context->me, payload, size);
+void actorsystem_sendme(Context *context, const MsgType *type, const void *payload) {
+  actorcell_send(context->me, type, payload);
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -649,15 +662,18 @@ typedef struct PingerState {
   int numPings;
 } PingerState;
 
-typedef struct PingerMsg {
+typedef struct PingerPingParams {
   int num;
-} PingerMsg;
+} PingerPingParams;
+
+const MsgType PingerPing = { .name = "Ping", .size = sizeof(PingerPingParams), };
 
 void pinger_on_start(Context *context) {
   PingerState *state = malloc(sizeof(PingerState));
   state->numPings = 0;
 
-  actorsystem_sendme(context, "msg", 4);
+  PingerPingParams msgToSend = { .num = state->numPings };
+  actorsystem_sendme(context, &PingerPing, &msgToSend);
 
   context->state = state;
 
@@ -667,18 +683,19 @@ void pinger_on_start(Context *context) {
 void * pinger_on_receive(Context *context, Msg *msg) {
   PingerState *state = context->state;
   PingerParams *params = context->params;
-  PingerMsg *msgRecv = msg->payload;
+  PingerPingParams *msgRecv = msg->payload;
 
   printf("Ping %d\n", msgRecv->num);
 
   state->numPings++;
 
   if (state->numPings >= params->maxPings) {
-    return NULL;
+    actorsystem_sendme(context, &Stop, NULL);
+    return pinger_on_receive;
   }
 
-  PingerMsg msgToSend = { .num = state->numPings };
-  actorsystem_sendme(context, &msgToSend, sizeof(msgToSend));
+  PingerPingParams msgToSend = { .num = state->numPings };
+  actorsystem_sendme(context, &PingerPing, &msgToSend);
 
   return pinger_on_receive;
 }
