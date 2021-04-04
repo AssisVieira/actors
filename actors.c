@@ -149,10 +149,8 @@ void actorcell_start(ActorCell *actorCell);
 bool actorcell_receive(ActorCell *actorCell, Msg *msg);
 void actorcell_stop(ActorCell *actorCell);
 
-
 typedef struct MailBox {
   ActorCell *actorCell;
-  atomic_bool shouldProcessMessage;
   Queue *queue;
   atomic_bool idle;
   void * (*state)(struct MailBox *mailbox);
