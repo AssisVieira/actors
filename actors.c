@@ -20,6 +20,8 @@
 // Msg
 ////////////////////////////////////////////////////////////////////////////////
 
+typedef struct ActorCell ActorCell;
+
 typedef struct MsgType {
   const char *name;
   size_t size;
@@ -28,12 +30,14 @@ typedef struct MsgType {
 typedef struct Msg {
   const MsgType *type;
   void *payload;
+  ActorCell *from;
 } Msg;
 
-Msg *msg_create(const MsgType *type, const void *payload) {
+Msg *msg_create(ActorCell *from, const MsgType *type, const void *payload) {
   Msg *msg = malloc(sizeof(Msg));
   msg->payload = malloc(type->size);
   msg->type = type;
+  msg->from = from;
 
   memcpy(msg->payload, payload, type->size);
 
@@ -46,6 +50,7 @@ void msg_free(Msg *msg) {
 }
 
 const MsgType Stop = { .name = "Stop", .size = 0, };
+const MsgType Stopped = { .name = "Stopped", .size = 0, };
 
 ////////////////////////////////////////////////////////////////////////////////
 // Actor
@@ -147,7 +152,7 @@ void actorcell_stop(ActorCell *actorCell);
 
 typedef struct MailBox {
   ActorCell *actorCell;
-  bool shouldProcessMessage;
+  atomic_bool shouldProcessMessage;
   Queue *queue;
   atomic_bool idle;
   void * (*state)(struct MailBox *mailbox);
@@ -170,12 +175,20 @@ MailBox *mailbox_create(int size, bool affinity) {
   mailbox->idle = true;
   mailbox->queue = queue_create(size);
   mailbox->state = mailbox_process_start;
-  mailbox->shouldProcessMessage = true;
   mailbox->affinity = affinity;
+  mailbox->worker = -1;
   return mailbox;
 }
 
+void mailbox_clear(MailBox *mailbox) {
+  Msg *msg = NULL;
+  while (msg = queue_get(mailbox->queue)) {
+    msg_free(msg);
+  }
+}
+
 void mailbox_free(MailBox *mailbox) {
+  mailbox_clear(mailbox);
   queue_free(mailbox->queue);
   free(mailbox);
 }
@@ -219,10 +232,6 @@ void * mailbox_process_empty(MailBox *mailbox) {
 }
 
 void * mailbox_process_next_message(MailBox *mailbox) {
-  if (!mailbox->shouldProcessMessage) {
-    return mailbox_process_next_message;
-  }
-
   Msg *msg = queue_get(mailbox->queue);
 
   if (msg == NULL) {
@@ -481,25 +490,73 @@ void dispatcher_dispatch(Dispatcher *dispatcher, MailBox *mailbox, Msg *msg) {
 // ActorCell
 ////////////////////////////////////////////////////////////////////////////////
 
+typedef struct ActorCell ActorCell;
+
+typedef struct ActorCellList {
+  ActorCell *actor;
+  struct ActorCellList *next;
+} ActorCellList;
+
 typedef struct ActorCell {
   MailBox *mailbox;
   Actor actor;
   Context context;
   Dispatcher *dispatcher;
+  struct ActorCell *parent;
+  struct ActorCellList *children;
+  int childrenCount;
 } ActorCell;
 
-ActorCell *actorcell_create(const Actor *actor, const void *params, size_t size, Dispatcher *dispatcher, bool affinity) {
+int actorcell_add_child(ActorCell *parent, ActorCell *child) {
+  ActorCellList *node = malloc(sizeof(ActorCellList));
+  node->next = parent->children;
+  node->actor = child;
+  parent->children = node;
+  return ++parent->childrenCount;
+}
+
+int actorcell_remove_child(ActorCell *parent, ActorCell *child) {
+  ActorCellList *node = parent->children;
+  ActorCellList *prev = NULL;
+  while (node != NULL) {
+    if (node->actor == child) {
+      if (prev == NULL) {
+        parent->children = node->next;
+      } else {
+        prev->next = node->next;
+      }
+      free(node);
+      break;
+    }
+    prev = node;
+    node = node->next;
+  }
+  return --parent->childrenCount;
+}
+
+int actorcell_children_count(const ActorCell *actor) {
+  return actor->childrenCount;
+}
+
+ActorCell *actorcell_create(ActorCell *parent, const Actor *actor, const void *params, size_t size, Dispatcher *dispatcher, bool affinity) {
   ActorCell *actorCell = malloc(sizeof(ActorCell));
   actorCell->actor = *actor;
   actorCell->mailbox = mailbox_create(1000, affinity);
   actorCell->dispatcher = dispatcher;
   actorCell->context.state = NULL;
   actorCell->context.me = actorCell;
+  actorCell->parent = parent;
+  actorCell->children = NULL;
+  actorCell->childrenCount = 0;
 
   actorCell->context.params = malloc(size);
   memcpy(actorCell->context.params, params, size);
 
   mailbox_set_actorcell(actorCell->mailbox, actorCell);
+
+  if (parent != NULL) {
+    actorcell_add_child(parent, actorCell);
+  }
 
   dispatcher_register_for_execution(actorCell->dispatcher, actorCell->mailbox);
 
@@ -509,6 +566,7 @@ ActorCell *actorcell_create(const Actor *actor, const void *params, size_t size,
 void actorcell_free(ActorCell *actorCell) {
   free(actorCell->context.params);
   mailbox_free(actorCell->mailbox);
+  free(actorCell->children);
   free(actorCell);
 }
 
@@ -517,21 +575,28 @@ void actorcell_start(ActorCell *actorCell) {
 }
 
 bool actorcell_receive(ActorCell *actorCell, Msg *msg) {
+  if (msg->type == &Stopped) {
+    actorcell_remove_child(actorCell, msg->from);
+  }
+
   actorCell->actor.onReceive = actorCell->actor.onReceive(&actorCell->context, msg);
+
   return (actorCell->actor.onReceive != NULL) ? true : false;
+}
+
+void actorcell_send(ActorCell *from, ActorCell *to, const MsgType *type, const void *payload) {
+  Msg *msg = msg_create(from, type, payload);
+  dispatcher_dispatch(to->dispatcher, to->mailbox, msg);
 }
 
 void actorcell_stop(ActorCell *actorCell) {
   actorCell->actor.onStop(&actorCell->context);
+  if (actorCell->parent != NULL)
+    actorcell_send(actorCell, actorCell->parent, &Stopped, NULL);
 }
 
 MailBox *actorcell_mailbox(ActorCell *actorCell) {
   return actorCell->mailbox;
-}
-
-void actorcell_send(ActorCell *actorCell, const MsgType *type, const void *payload) {
-  Msg *msg = msg_create(type, payload);
-  dispatcher_dispatch(actorCell->dispatcher, actorCell->mailbox, msg);
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -542,9 +607,12 @@ typedef struct ActorRef {
   ActorCell *actorCell;
 } ActorRef;
 
-ActorRef *actorref_create(const Actor *actor, const void *params, size_t size, Dispatcher *dispatcher, bool affinity) {
+ActorRef *actorref_create(ActorRef *parent, const Actor *actor, 
+    const void *params, size_t size, Dispatcher *dispatcher, bool affinity) {
+  ActorCell *parentCell = (parent != NULL) ? parent->actorCell : NULL;
   ActorRef *actorRef = malloc(sizeof(ActorRef));
-  actorRef->actorCell = actorcell_create(actor, params, size, dispatcher, affinity);
+  actorRef->actorCell = 
+    actorcell_create(parentCell, actor, params, size, dispatcher, affinity);
   return actorRef;
 }
 
@@ -553,8 +621,8 @@ void actorref_free(ActorRef *actorRef) {
   free(actorRef);
 }
 
-void actorref_send(ActorRef *actorRef, const MsgType *type, const void *payload) {
-  actorcell_send(actorRef->actorCell, type, payload);
+void actorref_send(ActorRef *from, ActorRef *to, const MsgType *type, const void *payload) {
+  actorcell_send(from->actorCell, to->actorCell, type, payload);
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -565,16 +633,47 @@ typedef struct ActorSystem {
   Executor *executor;
   Dispatcher *dispatcher;
   atomic_bool stop;
+  atomic_bool stopChildren;
+  pthread_cond_t waitCond;
+  pthread_mutex_t waitMutex;
 } ActorSystem;
 
 static ActorSystem *ACTOR_SYSTEM = NULL;
 
-void actorsystem_stop() {
+void system_on_start(Context *context);
+void * system_on_receive(Context *context, Msg *msg);
+void system_on_stop(Context *context);
+
+Actor System = {
+  .onStart = system_on_start,
+  .onReceive = system_on_receive,
+  .onStop = system_on_stop,
+};
+
+void system_on_start(Context *context) { 
+ 
+}
+
+void * system_on_receive(Context *context, Msg *msg) {
+
+  if (msg->type == &Stopped) {
+    if (actorcell_children_count(context->me) == 0) {
+      return NULL;
+    }
+  }
+
+  return system_on_receive;
+}
+
+void system_on_stop(Context *context) {
+  pthread_mutex_lock(&ACTOR_SYSTEM->waitMutex);
   ACTOR_SYSTEM->stop = true;
+  pthread_cond_signal(&ACTOR_SYSTEM->waitCond);
+  pthread_mutex_unlock(&ACTOR_SYSTEM->waitMutex);
 }
 
 void actorsystem_sig_term_handler(int signum, siginfo_t *info, void *ptr) {
-  actorsystem_stop();
+  ACTOR_SYSTEM->stopChildren = true;
 }
 
 int actorsystem_setup_signals() {
@@ -595,50 +694,63 @@ int actorsystem_setup_signals() {
   return 0;
 }
 
-void actorsystem_create(int cores) {
+ActorRef *actorsystem_actor_ref(ActorRef *parent, const Actor *actor, const void *params, size_t size, bool affinity) {
+  return actorref_create(parent, actor, params, size, ACTOR_SYSTEM->dispatcher, affinity);
+}
+
+ActorRef * actorsystem_create(int cores) {
+  printf("Starting actor system.\n");
+
   ActorSystem *actorSystem = malloc(sizeof(ActorSystem));
   actorSystem->executor = executor_create(cores);
   actorSystem->dispatcher = dispatcher_create(actorSystem->executor);
   actorSystem->stop = false;
+  actorSystem->stopChildren = false;
+  actorSystem->waitCond = (pthread_cond_t) PTHREAD_COND_INITIALIZER;
+  actorSystem->waitMutex = (pthread_mutex_t) PTHREAD_MUTEX_INITIALIZER;
 
   ACTOR_SYSTEM = actorSystem;
 
   actorsystem_setup_signals();
+
+  return actorsystem_actor_ref(NULL, &System, NULL, 0, false);
 }
 
-ActorRef *actorsystem_actor_ref(const Actor *actor, const void *params, size_t size, bool affinity) {
-  return actorref_create(actor, params, size, ACTOR_SYSTEM->dispatcher, affinity);
+void actorsystem_send(ActorCell *from, ActorCell *to, 
+    const MsgType *type, const void *payload) {
+  actorcell_send(from, to, type, payload);
 }
 
-int actorsystem_main(const Actor *actor, const void *params, size_t size, bool affinity, int cores) {
-  printf("Starting actor system.\n");
-
-  actorsystem_create(cores);
-
-  ActorRef *mainActor = actorsystem_actor_ref(actor, params, size, affinity);
-
+int actorsystem_wait(ActorRef *system) {
   while (!ACTOR_SYSTEM->stop) {
-    sleep(1);
+    pthread_mutex_lock(&ACTOR_SYSTEM->waitMutex);
+    struct timespec spec;
+    clock_gettime(CLOCK_REALTIME, &spec);
+    spec.tv_sec += 1;
+    pthread_cond_timedwait(&ACTOR_SYSTEM->waitCond, &ACTOR_SYSTEM->waitMutex, &spec);
+    pthread_mutex_unlock(&ACTOR_SYSTEM->waitMutex);
+
+    if (ACTOR_SYSTEM->stopChildren) {
+      printf("Stopping children...\n");
+      ActorCellList *node = system->actorCell->children;
+      while (node != NULL) {
+        actorsystem_send(system->actorCell, node->actor, &Stop, NULL);
+        node = node->next;
+      }
+    }
   }
-
-  actorref_free(mainActor);
-
-  dispatcher_free(ACTOR_SYSTEM->dispatcher);
-  executor_destroy(ACTOR_SYSTEM->executor);
-  free(ACTOR_SYSTEM);
-
-  printf("\nActor system stopped.\n");
 
   return 0;
 }
 
-void actorsystem_send(ActorRef *actorRef, const MsgType *type, const void *payload) {
-  actorref_send(actorRef, type, payload);
+void actorsystem_free(ActorRef *system) {
+  actorref_free(system);
+  dispatcher_free(ACTOR_SYSTEM->dispatcher);
+  executor_destroy(ACTOR_SYSTEM->executor);
+  free(ACTOR_SYSTEM);
+  printf("\nActor system stopped.\n");
 }
 
-void actorsystem_sendme(Context *context, const MsgType *type, const void *payload) {
-  actorcell_send(context->me, type, payload);
-}
 
 ////////////////////////////////////////////////////////////////////////////////
 // ActorPing
@@ -673,7 +785,7 @@ void pinger_on_start(Context *context) {
   state->numPings = 0;
 
   PingerPingParams msgToSend = { .num = state->numPings };
-  actorsystem_sendme(context, &PingerPing, &msgToSend);
+  actorsystem_send(context->me, context->me, &PingerPing, &msgToSend);
 
   context->state = state;
 
@@ -687,22 +799,22 @@ void * pinger_on_receive(Context *context, Msg *msg) {
 
   printf("Ping %d\n", msgRecv->num);
 
-  state->numPings++;
-
   if (state->numPings >= params->maxPings) {
-    actorsystem_sendme(context, &Stop, NULL);
+    actorsystem_send(context->me, context->me, &Stop, NULL);
     return pinger_on_receive;
   }
 
+  state->numPings++;
+
   PingerPingParams msgToSend = { .num = state->numPings };
-  actorsystem_sendme(context, &PingerPing, &msgToSend);
+  actorsystem_send(context->me, context->me, &PingerPing, &msgToSend);
 
   return pinger_on_receive;
 }
 
 void pinger_on_stop(Context *context) {
   free(context->state);
-  printf("Pinger stopped.\n");
+  printf("Pinger stopped. Has msg? %s\n", mailbox_has_message(context->me->mailbox) ? "true" : "false" );
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -710,7 +822,40 @@ void pinger_on_stop(Context *context) {
 ////////////////////////////////////////////////////////////////////////////////
 
 int main() {
-  PingerParams params = {.maxPings = 10000};
-  return actorsystem_main(&Pinger, &params, sizeof(PingerParams), true, 4);
-}
+  ActorRef *system = actorsystem_create(4 /* cores */);
+  
+  ActorRef *pinger = actorsystem_actor_ref(system, 
+                          &Pinger, 
+                          &(PingerParams){ .maxPings = 10000 }, 
+                          sizeof(PingerParams), 
+                          true);
 
+  ActorRef *pinger2 = actorsystem_actor_ref(system, 
+                          &Pinger, 
+                          &(PingerParams){ .maxPings = 10000 }, 
+                          sizeof(PingerParams), 
+                          true);
+
+  ActorRef *pinger3 = actorsystem_actor_ref(system, 
+                          &Pinger, 
+                          &(PingerParams){ .maxPings = 10000 }, 
+                          sizeof(PingerParams), 
+                          true);
+
+  ActorRef *pinger4 = actorsystem_actor_ref(system, 
+                          &Pinger, 
+                          &(PingerParams){ .maxPings = 10000 }, 
+                          sizeof(PingerParams), 
+                          true);
+
+  int result = actorsystem_wait(system);
+
+  actorref_free(pinger);
+  actorref_free(pinger2);
+  actorref_free(pinger3);
+  actorref_free(pinger4);
+
+  actorsystem_free(system);
+
+  return result;
+}
