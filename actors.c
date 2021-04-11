@@ -17,6 +17,19 @@
 #include <errno.h>
 
 ////////////////////////////////////////////////////////////////////////////////
+// Debug
+////////////////////////////////////////////////////////////////////////////////
+
+static bool DEBUG_ENABLED = false;
+
+#define debug(FMT, ...) \
+if (DEBUG_ENABLED) {\
+  char pthreadName[32] = {0};\
+  pthread_getname_np(pthread_self(), pthreadName, sizeof(pthreadName));\
+  printf("[%s] " FMT "\n", pthreadName, ##__VA_ARGS__);\
+}
+
+////////////////////////////////////////////////////////////////////////////////
 // Msg
 ////////////////////////////////////////////////////////////////////////////////
 
@@ -57,9 +70,11 @@ const MsgType Stopped = { .name = "Stopped", .size = 0, };
 ////////////////////////////////////////////////////////////////////////////////
 
 typedef struct ActorCell ActorCell;
+typedef struct ActorRef ActorRef;
 
 typedef struct Context {
   ActorCell *me;
+  ActorRef *ref;
   void *params;
   void *state;
 } Context;
@@ -77,7 +92,6 @@ typedef struct Actor {
 typedef struct Queue {
   atomic_int reader;
   atomic_int writer;
-  pthread_mutex_t writerMutex;
   int max;
   void **items;
 } Queue;
@@ -97,7 +111,6 @@ Queue *queue_create(int max) {
   queue->reader = 0;
   queue->writer = 0;
   queue->max = max + 1;
-  queue->writerMutex = (pthread_mutex_t) PTHREAD_MUTEX_INITIALIZER;
 
   return queue;
 }
@@ -109,35 +122,28 @@ void queue_free(Queue *queue) {
 
 bool queue_add(Queue *queue, void *item) {
   if (queue == NULL || item == NULL) return false;
-
   bool r = false;
-
-  pthread_mutex_lock(&queue->writerMutex);
-
   const int newWriter = (queue->writer + 1) % queue->max;
-
   if (newWriter != queue->reader) {
     queue->items[queue->writer] = item;
     queue->writer = newWriter;
     r = true;
   }
-
-  pthread_mutex_unlock(&queue->writerMutex);
-
   return r;
 }
 
-bool queue_is_empty(const Queue *queue) {
-  return queue->reader == queue->writer;
+bool queue_is_empty(Queue *queue) {
+  bool empty = (queue->reader == queue->writer) ? true : false;
+  return empty;
 }
 
 void * queue_get(Queue *queue) {
-  if (!queue_is_empty(queue)) {
-    void *item = queue->items[queue->reader];
+  void *item = NULL;
+  if (queue->reader != queue->writer) {
+    item = queue->items[queue->reader];
     queue->reader = (queue->reader + 1) % queue->max;
-    return item;
   }
-  return NULL;
+  return item;
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -147,7 +153,7 @@ void * queue_get(Queue *queue) {
 typedef struct ActorCell ActorCell;
 void actorcell_start(ActorCell *actorCell);
 bool actorcell_receive(ActorCell *actorCell, Msg *msg);
-void actorcell_stop(ActorCell *actorCell);
+const char *actorcell_name(const ActorCell *actorCell);
 
 typedef struct MailBox {
   ActorCell *actorCell;
@@ -156,13 +162,8 @@ typedef struct MailBox {
   void * (*state)(struct MailBox *mailbox);
   bool affinity;
   int worker;
+  pthread_mutex_t mutex;
 } MailBox;
-
-typedef enum MailBoxProcessResult {
-  MAILBOX_OK = 0,
-  MAILBOX_BLOCKED = -1,
-  MAILBOX_EMPTY = -2,
-} MailBoxProcessResult;
 
 void * mailbox_process_start(MailBox *mailbox);
 void * mailbox_process_next_message(MailBox *mailbox);
@@ -175,12 +176,13 @@ MailBox *mailbox_create(int size, bool affinity) {
   mailbox->state = mailbox_process_start;
   mailbox->affinity = affinity;
   mailbox->worker = -1;
+  mailbox->mutex = (pthread_mutex_t) PTHREAD_MUTEX_INITIALIZER;
   return mailbox;
 }
 
 void mailbox_clear(MailBox *mailbox) {
   Msg *msg = NULL;
-  while (msg = queue_get(mailbox->queue)) {
+  while ((msg = queue_get(mailbox->queue))) {
     msg_free(msg);
   }
 }
@@ -193,6 +195,10 @@ void mailbox_free(MailBox *mailbox) {
 
 bool mailbox_has_message(const MailBox *mailbox) {
   return ! queue_is_empty(mailbox->queue);
+}
+
+const char *mailbox_name(const MailBox *mailbox) {
+  return actorcell_name(mailbox->actorCell);
 }
 
 bool mailbox_is_idle(const MailBox *mailbox) {
@@ -214,15 +220,13 @@ void mailbox_set_actorcell(MailBox *mailbox, ActorCell *actorCell) {
 }
 
 void mailbox_enqueue(MailBox *mailbox, Msg *msg) {
+  pthread_mutex_lock(&mailbox->mutex);
   queue_add(mailbox->queue, msg);
-}
-
-void * mailbox_process_stop(MailBox *mailbox) {
-  actorcell_stop(mailbox->actorCell);
-  return NULL;
+  pthread_mutex_unlock(&mailbox->mutex);
 }
 
 void * mailbox_process_empty(MailBox *mailbox) {
+  debug("%s mailbox empty.", actorcell_name(mailbox->actorCell));
   if (queue_is_empty(mailbox->queue)) {
     return mailbox_process_empty;
   }
@@ -236,20 +240,14 @@ void * mailbox_process_next_message(MailBox *mailbox) {
     return mailbox_process_empty;
   }
 
-  bool keepGoing = false;
-
-  if (msg->type == &Stop) {
-    keepGoing = false;
-  } else {
-    keepGoing = actorcell_receive(mailbox->actorCell, msg);
-  }
+  bool keepGoing = actorcell_receive(mailbox->actorCell, msg);
 
   msg_free(msg);
 
   if (keepGoing)
     return mailbox_process_next_message;
 
-  return mailbox_process_stop;
+  return NULL;
 }
 
 void * mailbox_process_start(MailBox *mailbox) {
@@ -262,18 +260,24 @@ void * mailbox_process_start(MailBox *mailbox) {
  * Returns true if the mailbox must be processed again, otherwise returns false.
  */
 bool mailbox_process(MailBox *mailbox) {
+  if (mailbox->state == NULL) return false;
   mailbox->state = mailbox->state(mailbox);
   return (mailbox->state == NULL || 
       mailbox->state == mailbox_process_empty) ? false : true;
 }
 
+void *mailbox_state(MailBox *mailbox) {
+  return mailbox->state;
+}
 
 ////////////////////////////////////////////////////////////////////////////////
 // Worker
 ////////////////////////////////////////////////////////////////////////////////
 
 typedef struct Executor Executor;
+
 void executor_execute(Executor *executor, MailBox *mailbox);
+void actorsystem_register_execution(MailBox *mailbox);
 
 typedef struct Worker {
   pthread_t thread;
@@ -285,6 +289,7 @@ typedef struct Worker {
   int throughputDeadlineNS;
   Executor *executor;
   int core;
+  char *name;
 } Worker;
 
 void *worker_run(void *arg);
@@ -304,7 +309,7 @@ int worker_set_core_affinity(int core) {
   return pthread_setaffinity_np(currentThread, sizeof(cpu_set_t), &cpuset);
 }
 
-Worker *worker_create(Executor *executor, int core, int throughput, int throughputDeadlineNS) {
+Worker *worker_create(Executor *executor, const char *name, int core, int throughput, int throughputDeadlineNS) {
   Worker *worker = malloc(sizeof(Worker));
   worker->executor = executor;
   worker->stop = false;
@@ -314,28 +319,34 @@ Worker *worker_create(Executor *executor, int core, int throughput, int throughp
   worker->condNotEmpty = (pthread_cond_t) PTHREAD_COND_INITIALIZER;
   worker->throughputDeadlineNS = throughputDeadlineNS;
   worker->throughput = throughput;
+  worker->name = strdup(name);
 
   pthread_create(&worker->thread, NULL, worker_run, worker);
+
+  pthread_setname_np(worker->thread, name);
 
   return worker;  
 }
 
 void worker_free(Worker *worker) {
-  pthread_mutex_lock(&worker->mutex);
-  pthread_cond_signal(&worker->condNotEmpty);
-  pthread_mutex_unlock(&worker->mutex);
-
   pthread_join(worker->thread, NULL);
 
   queue_free(worker->queue);
+
+  free(worker->name);
 
   free(worker);
 }
 
 void worker_enqueue(Worker *worker, MailBox *mailbox) {
   pthread_mutex_lock(&worker->mutex);
+
   queue_add(worker->queue, mailbox);
+
   pthread_cond_signal(&worker->condNotEmpty);
+
+  debug("Notificando %s.", worker->name);
+
   pthread_mutex_unlock(&worker->mutex);
 }
 
@@ -356,18 +367,23 @@ void *worker_run(void *arg) {
   Worker *worker =  (Worker *) arg;
 
   if (worker_set_core_affinity(worker->core)) {
-    printf("[worker] set core affinity fail.\n");
+    debug("set core affinity fail.");
   }
 
   while (!worker->stop) {
+    pthread_mutex_lock(&worker->mutex);
+
     MailBox *mailbox = queue_get(worker->queue);
 
     if (mailbox == NULL) {
-      pthread_mutex_lock(&worker->mutex);
+      debug("Sem mailboxes.");
       pthread_cond_wait(&worker->condNotEmpty, &worker->mutex);
-      pthread_mutex_unlock(&worker->mutex);
-      continue;
+      debug("Fui notificado.");
     }
+
+    pthread_mutex_unlock(&worker->mutex);
+
+    if (mailbox == NULL) continue;
 
     int leftThroughput = worker->throughput;
     long deadlineNS = worker_current_time_ns() + worker->throughputDeadlineNS;
@@ -380,10 +396,11 @@ void *worker_run(void *arg) {
       leftThroughput--;
     }
 
-    if (keepGoing) {
-      executor_execute(worker->executor, mailbox);
-    } else {
-      mailbox_set_idle(mailbox);
+    mailbox_set_idle(mailbox);
+    
+    if (mailbox_state(mailbox) != NULL) {
+      debug("MailBox state != NULL");
+      actorsystem_register_execution(mailbox);
     }
   }
 
@@ -391,7 +408,10 @@ void *worker_run(void *arg) {
 }
 
 void worker_stop(Worker *worker) {
+  pthread_mutex_lock(&worker->mutex);
   worker->stop = true;
+  pthread_cond_signal(&worker->condNotEmpty);
+  pthread_mutex_unlock(&worker->mutex);
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -416,7 +436,10 @@ Executor *executor_create(int numWorkers) {
   int numCores = sysconf(_SC_NPROCESSORS_ONLN);
 
   for (int i = 0; i < numWorkers; i++) {
-    executor->workers[i] = worker_create(executor, i % numCores, throughput, throughputDeadlineNS);
+    char name[32] = {0,};
+    snprintf(name, sizeof(name)-1, "worker-%d", i);
+    name[31] = '\0';
+    executor->workers[i] = worker_create(executor, name, i % numCores, throughput, throughputDeadlineNS);
   }
 
   return executor;
@@ -436,6 +459,7 @@ void executor_destroy(Executor *executor) {
 void executor_execute(Executor *executor, MailBox *mailbox) {
   int worker = mailbox->worker;
   bool undefinedWorker = (worker < 0) ? true : false;
+  const char *mailboxName = mailbox_name(mailbox);
 
   if (!mailbox->affinity || (mailbox->affinity && undefinedWorker)) {
     int currentWorker = executor->currentWorker;
@@ -449,6 +473,8 @@ void executor_execute(Executor *executor, MailBox *mailbox) {
   }
 
   mailbox->worker = worker;
+
+  debug("%s foi agendado em %s.", mailboxName, executor->workers[worker]->name);
 
   worker_enqueue(executor->workers[worker], mailbox);
 }
@@ -472,14 +498,23 @@ void dispatcher_free(Dispatcher *dispatcher) {
 }
 
 void dispatcher_register_for_execution(Dispatcher *dispatcher, MailBox *mailbox) {
-  if (/*mailbox_has_message(mailbox) &&*/ mailbox_is_idle(mailbox)) {
+  bool hasMsg = mailbox_has_message(mailbox);
+  bool isIdle = mailbox_is_idle(mailbox);
+  const char *mailboxName = mailbox_name(mailbox);
+
+  debug("Tentando agendar execução de %s [msg? %d idle? %d]", mailboxName, hasMsg, isIdle);
+
+  if (hasMsg && isIdle) {
     if (mailbox_set_scheduled(mailbox)) {
       executor_execute(dispatcher->executor, mailbox);
+    } else {
+      debug("Não agendado, pois %s já esta agendado.", mailboxName);
     }
   }
 }
 
 void dispatcher_dispatch(Dispatcher *dispatcher, MailBox *mailbox, Msg *msg) {
+  debug("%s enviando %s para %s", actorcell_name(msg->from), msg->type->name, mailbox_name(mailbox));
   mailbox_enqueue(mailbox, msg);
   dispatcher_register_for_execution(dispatcher, mailbox);
 }
@@ -489,6 +524,10 @@ void dispatcher_dispatch(Dispatcher *dispatcher, MailBox *mailbox, Msg *msg) {
 ////////////////////////////////////////////////////////////////////////////////
 
 typedef struct ActorCell ActorCell;
+typedef struct ActorRef ActorRef;
+
+ActorRef *actorref_create_weak(ActorCell *actorCell);
+void actorref_free(ActorRef *actorRef);
 
 typedef struct ActorCellList {
   ActorCell *actor;
@@ -503,6 +542,8 @@ typedef struct ActorCell {
   struct ActorCell *parent;
   struct ActorCellList *children;
   int childrenCount;
+  bool stopping;
+  char *name;
 } ActorCell;
 
 int actorcell_add_child(ActorCell *parent, ActorCell *child) {
@@ -536,16 +577,19 @@ int actorcell_children_count(const ActorCell *actor) {
   return actor->childrenCount;
 }
 
-ActorCell *actorcell_create(ActorCell *parent, const Actor *actor, const void *params, size_t size, Dispatcher *dispatcher, bool affinity) {
+ActorCell *actorcell_create(ActorCell *parent, const char *name, const Actor *actor, const void *params, size_t size, Dispatcher *dispatcher, bool affinity) {
   ActorCell *actorCell = malloc(sizeof(ActorCell));
   actorCell->actor = *actor;
   actorCell->mailbox = mailbox_create(1000, affinity);
   actorCell->dispatcher = dispatcher;
   actorCell->context.state = NULL;
   actorCell->context.me = actorCell;
+  actorCell->context.ref = actorref_create_weak(actorCell);
   actorCell->parent = parent;
   actorCell->children = NULL;
   actorCell->childrenCount = 0;
+  actorCell->stopping = false;
+  actorCell->name = strdup(name);
 
   actorCell->context.params = malloc(size);
   memcpy(actorCell->context.params, params, size);
@@ -556,14 +600,16 @@ ActorCell *actorcell_create(ActorCell *parent, const Actor *actor, const void *p
     actorcell_add_child(parent, actorCell);
   }
 
-  dispatcher_register_for_execution(actorCell->dispatcher, actorCell->mailbox);
+  executor_execute(actorCell->dispatcher->executor, actorCell->mailbox);
 
   return actorCell;
 }
 
 void actorcell_free(ActorCell *actorCell) {
+  actorref_free(actorCell->context.ref);
   free(actorCell->context.params);
   mailbox_free(actorCell->mailbox);
+  free(actorCell->name);
   free(actorCell->children);
   free(actorCell);
 }
@@ -572,25 +618,55 @@ void actorcell_start(ActorCell *actorCell) {
   actorCell->actor.onStart(&actorCell->context);
 }
 
-bool actorcell_receive(ActorCell *actorCell, Msg *msg) {
-  if (msg->type == &Stopped) {
-    actorcell_remove_child(actorCell, msg->from);
-  }
-
-  actorCell->actor.onReceive = actorCell->actor.onReceive(&actorCell->context, msg);
-
-  return (actorCell->actor.onReceive != NULL) ? true : false;
-}
-
 void actorcell_send(ActorCell *from, ActorCell *to, const MsgType *type, const void *payload) {
   Msg *msg = msg_create(from, type, payload);
   dispatcher_dispatch(to->dispatcher, to->mailbox, msg);
 }
 
-void actorcell_stop(ActorCell *actorCell) {
-  actorCell->actor.onStop(&actorCell->context);
-  if (actorCell->parent != NULL)
-    actorcell_send(actorCell, actorCell->parent, &Stopped, NULL);
+void actorcell_stop(ActorCell *actorCell, Msg *msg) {
+  actorCell->stopping = true;
+
+  ActorCellList *child = actorCell->children;
+
+  while (child != NULL) {
+    actorcell_send(actorCell, child->actor, &Stop, NULL);
+    child = child->next;
+  }
+}
+
+void actorcell_stopped(ActorCell *actorCell, Msg *msg) {
+  actorcell_remove_child(actorCell, msg->from);
+}
+
+bool actorcell_receive(ActorCell *actorCell, Msg *msg) {
+  if (msg->type == &Stop) {
+    actorcell_stop(actorCell, msg);
+  } else if (msg->type == &Stopped) {
+    actorcell_stopped(actorCell, msg);
+  } else {
+    actorCell->actor.onReceive = actorCell->actor.onReceive(&actorCell->context, msg);
+    if (actorCell->actor.onReceive == NULL) {
+      actorcell_stop(actorCell, NULL);
+    } 
+  }
+
+  debug("actorCell->children = %p", actorCell->children);
+  debug("actorCell->childrenCount = %d", actorCell->childrenCount);
+
+  if ((actorCell->stopping || actorCell->parent == NULL) && actorCell->children == NULL) {
+    actorCell->actor.onStop(&actorCell->context);
+    if (actorCell->parent != NULL) {
+      actorcell_send(actorCell, actorCell->parent, &Stopped, NULL);
+    }
+    debug("ActorCell stopped (keepGoing = false)");
+    return false; 
+  }
+
+  return true;
+}
+
+const char *actorcell_name(const ActorCell *actorCell) {
+  return actorCell->name;
 }
 
 MailBox *actorcell_mailbox(ActorCell *actorCell) {
@@ -603,19 +679,30 @@ MailBox *actorcell_mailbox(ActorCell *actorCell) {
 
 typedef struct ActorRef {
   ActorCell *actorCell;
+  bool weak;
 } ActorRef;
 
-ActorRef *actorref_create(ActorRef *parent, const Actor *actor, 
+ActorRef *actorref_create(ActorRef *parent, const char *name, const Actor *actor, 
     const void *params, size_t size, Dispatcher *dispatcher, bool affinity) {
   ActorCell *parentCell = (parent != NULL) ? parent->actorCell : NULL;
   ActorRef *actorRef = malloc(sizeof(ActorRef));
+  actorRef->weak = false;
   actorRef->actorCell = 
-    actorcell_create(parentCell, actor, params, size, dispatcher, affinity);
+    actorcell_create(parentCell, name, actor, params, size, dispatcher, affinity);
+  return actorRef;
+}
+
+ActorRef *actorref_create_weak(ActorCell *actorCell) {
+  ActorRef *actorRef = malloc(sizeof(ActorRef));
+  actorRef->weak = true;
+  actorRef->actorCell = actorCell;
   return actorRef;
 }
 
 void actorref_free(ActorRef *actorRef) {
-  actorcell_free(actorRef->actorCell);
+  if (!actorRef->weak) {
+    actorcell_free(actorRef->actorCell);
+  }
   free(actorRef);
 }
 
@@ -632,6 +719,7 @@ typedef struct ActorSystem {
   Dispatcher *dispatcher;
   atomic_bool stop;
   atomic_bool stopChildren;
+  atomic_bool stopChildrenDone;
   pthread_cond_t waitCond;
   pthread_mutex_t waitMutex;
 } ActorSystem;
@@ -642,6 +730,10 @@ void system_on_start(Context *context);
 void * system_on_receive(Context *context, Msg *msg);
 void system_on_stop(Context *context);
 
+void actorsystem_register_execution(MailBox *mailbox) {
+  dispatcher_register_for_execution(ACTOR_SYSTEM->dispatcher, mailbox);
+}
+
 Actor System = {
   .onStart = system_on_start,
   .onReceive = system_on_receive,
@@ -649,17 +741,10 @@ Actor System = {
 };
 
 void system_on_start(Context *context) { 
- 
+  debug("System Actor started.");
 }
 
 void * system_on_receive(Context *context, Msg *msg) {
-
-  if (msg->type == &Stopped) {
-    if (actorcell_children_count(context->me) == 0) {
-      return NULL;
-    }
-  }
-
   return system_on_receive;
 }
 
@@ -667,6 +752,7 @@ void system_on_stop(Context *context) {
   pthread_mutex_lock(&ACTOR_SYSTEM->waitMutex);
   ACTOR_SYSTEM->stop = true;
   pthread_cond_signal(&ACTOR_SYSTEM->waitCond);
+  debug("System stopped.");
   pthread_mutex_unlock(&ACTOR_SYSTEM->waitMutex);
 }
 
@@ -692,18 +778,19 @@ int actorsystem_setup_signals() {
   return 0;
 }
 
-ActorRef *actorsystem_actor_ref(ActorRef *parent, const Actor *actor, const void *params, size_t size, bool affinity) {
-  return actorref_create(parent, actor, params, size, ACTOR_SYSTEM->dispatcher, affinity);
+ActorRef *actorsystem_actor_ref(ActorRef *parent, const char *name, const Actor *actor, const void *params, size_t size, bool affinity) {
+  return actorref_create(parent, name, actor, params, size, ACTOR_SYSTEM->dispatcher, affinity);
 }
 
 ActorRef * actorsystem_create(int cores) {
-  printf("Starting actor system.\n");
+  debug("Starting actor system.");
 
   ActorSystem *actorSystem = malloc(sizeof(ActorSystem));
   actorSystem->executor = executor_create(cores);
   actorSystem->dispatcher = dispatcher_create(actorSystem->executor);
   actorSystem->stop = false;
   actorSystem->stopChildren = false;
+  actorSystem->stopChildrenDone = false;
   actorSystem->waitCond = (pthread_cond_t) PTHREAD_COND_INITIALIZER;
   actorSystem->waitMutex = (pthread_mutex_t) PTHREAD_MUTEX_INITIALIZER;
 
@@ -711,7 +798,7 @@ ActorRef * actorsystem_create(int cores) {
 
   actorsystem_setup_signals();
 
-  return actorsystem_actor_ref(NULL, &System, NULL, 0, false);
+  return actorsystem_actor_ref(NULL, "System", &System, NULL, 0, true);
 }
 
 void actorsystem_send(ActorCell *from, ActorCell *to, 
@@ -722,33 +809,86 @@ void actorsystem_send(ActorCell *from, ActorCell *to,
 int actorsystem_wait(ActorRef *system) {
   while (!ACTOR_SYSTEM->stop) {
     pthread_mutex_lock(&ACTOR_SYSTEM->waitMutex);
+    
     struct timespec spec;
     clock_gettime(CLOCK_REALTIME, &spec);
     spec.tv_sec += 1;
+    
     pthread_cond_timedwait(&ACTOR_SYSTEM->waitCond, &ACTOR_SYSTEM->waitMutex, &spec);
-    pthread_mutex_unlock(&ACTOR_SYSTEM->waitMutex);
+    
+    debug("Fui notificado!");
 
     if (ACTOR_SYSTEM->stopChildren) {
-      printf("Stopping children...\n");
-      ActorCellList *node = system->actorCell->children;
-      while (node != NULL) {
-        actorsystem_send(system->actorCell, node->actor, &Stop, NULL);
-        node = node->next;
+      if (ACTOR_SYSTEM->stopChildrenDone) {
+        debug("Waiting for children stop.");
+      } else {
+        ActorCellList *node = system->actorCell->children;
+        while (node != NULL) {
+          debug("Stopping child: %s", actorcell_name(node->actor));
+          actorsystem_send(system->actorCell, node->actor, &Stop, NULL);
+          node = node->next;
+        }
+        ACTOR_SYSTEM->stopChildrenDone = true;
       }
     }
-  }
 
+    pthread_mutex_unlock(&ACTOR_SYSTEM->waitMutex);
+  }
   return 0;
 }
 
 void actorsystem_free(ActorRef *system) {
-  actorref_free(system);
   dispatcher_free(ACTOR_SYSTEM->dispatcher);
   executor_destroy(ACTOR_SYSTEM->executor);
+  actorref_free(system);
   free(ACTOR_SYSTEM);
-  printf("\nActor system stopped.\n");
+  debug("Actor system stopped.");
 }
 
+////////////////////////////////////////////////////////////////////////////////
+// ActorPong
+////////////////////////////////////////////////////////////////////////////////
+
+typedef struct PingParams {
+  int num;
+} PingParams;
+
+const MsgType Ping = { .name = "Ping", .size = sizeof(PingParams), };
+
+void ponger_on_start(Context *context);
+void * ponger_on_receive(Context *context, Msg *msg);
+void ponger_on_stop(Context *context);
+
+Actor Ponger = {
+  .onStart = ponger_on_start,
+  .onReceive = ponger_on_receive,
+  .onStop = ponger_on_stop,
+};
+
+typedef struct PongParams {
+  int num;
+} PongParams;
+
+const MsgType Pong = { .name = "Pong", .size = sizeof(PongParams) };
+
+void ponger_on_start(Context *context) {
+  debug("Ponger started.");
+}
+
+void * ponger_on_receive(Context *context, Msg *msg) {
+  if (msg->type == &Ping) {
+    const PingParams *ping = msg->payload;
+    debug("Pong %d", ping->num);
+    PongParams pong = { .num = ping->num };
+    actorsystem_send(context->me, msg->from, &Pong, &pong);
+  }
+
+  return ponger_on_receive;
+}
+
+void ponger_on_stop(Context *context) {
+  debug("Ponger stopped.");
+}
 
 ////////////////////////////////////////////////////////////////////////////////
 // ActorPing
@@ -766,94 +906,101 @@ Actor Pinger = {
 
 typedef struct PingerParams {
   int maxPings;
+  bool debug;
 } PingerParams;
 
 typedef struct PingerState {
   int numPings;
+  //ActorRef *ponger;
 } PingerState;
 
-typedef struct PingerPingParams {
-  int num;
-} PingerPingParams;
-
-const MsgType PingerPing = { .name = "Ping", .size = sizeof(PingerPingParams), };
 
 void pinger_on_start(Context *context) {
   PingerState *state = malloc(sizeof(PingerState));
   state->numPings = 0;
+  //state->ponger = NULL;
+  //state->ponger = actorsystem_actor_ref(context->ref, "Ponger", &Ponger, NULL, 0, true);
 
-  PingerPingParams msgToSend = { .num = state->numPings };
-  actorsystem_send(context->me, context->me, &PingerPing, &msgToSend);
+  //PingParams ping = { .num = state->numPings };
+  //actorsystem_send(context->me, state->ponger->actorCell, &Ping, &ping);
+  PongParams pong = { .num = state->numPings };
+  actorsystem_send(context->me, context->me, &Pong, &pong);
 
   context->state = state;
 
-  printf("Pinger started.\n");
+  debug("Pinger started.");
 }
 
 void * pinger_on_receive(Context *context, Msg *msg) {
   PingerState *state = context->state;
   PingerParams *params = context->params;
-  PingerPingParams *msgRecv = msg->payload;
 
-  printf("Ping %d\n", msgRecv->num);
+  if (msg->type == &Pong) {
+    PongParams *pong = msg->payload;
 
-  if (state->numPings >= params->maxPings) {
-    actorsystem_send(context->me, context->me, &Stop, NULL);
-    return pinger_on_receive;
+    if (params->debug) {
+      debug("Ping %d", pong->num);
+    }
+
+    if (state->numPings >= params->maxPings) {
+      return NULL;
+    }
+
+    state->numPings++;
+
+    //PingParams ping = { .num = state->numPings };
+    //actorsystem_send(context->me, state->ponger->actorCell, &Ping, &ping);
+    PongParams pong2 = { .num = state->numPings };
+    actorsystem_send(context->me, context->me, &Pong, &pong2);
   }
-
-  state->numPings++;
-
-  PingerPingParams msgToSend = { .num = state->numPings };
-  actorsystem_send(context->me, context->me, &PingerPing, &msgToSend);
 
   return pinger_on_receive;
 }
 
 void pinger_on_stop(Context *context) {
-  free(context->state);
-  printf("Pinger stopped. Has msg? %s\n", mailbox_has_message(context->me->mailbox) ? "true" : "false" );
+  PingerState *state = context->state;
+  //actorref_free(state->ponger);
+  free(state);
+  debug("Pinger stopped.");
 }
 
 ////////////////////////////////////////////////////////////////////////////////
 // Main
 ////////////////////////////////////////////////////////////////////////////////
 
-int main() {
-  ActorRef *system = actorsystem_create(4 /* cores */);
-  
-  ActorRef *pinger = actorsystem_actor_ref(system, 
-                          &Pinger, 
-                          &(PingerParams){ .maxPings = 10000 }, 
-                          sizeof(PingerParams), 
-                          true);
+int main(int argc, char **argv) {
+  const int workers = atoi(argv[1]);
+  const int pingers = atoi(argv[2]);
+  const int pings = atoi(argv[3]);
+  const bool debugEnable = strcmp(argv[4], "true") ? false : true;
+  ActorRef *pingersRef[32] = {NULL};
 
-  ActorRef *pinger2 = actorsystem_actor_ref(system, 
-                          &Pinger, 
-                          &(PingerParams){ .maxPings = 10000 }, 
-                          sizeof(PingerParams), 
-                          true);
+  DEBUG_ENABLED = debugEnable;
 
-  ActorRef *pinger3 = actorsystem_actor_ref(system, 
-                          &Pinger, 
-                          &(PingerParams){ .maxPings = 10000 }, 
-                          sizeof(PingerParams), 
-                          true);
+  debug("Workers: %d", workers);
+  debug("Pingers: %d", pingers);
+  debug("Pings: %d", pings);
+  debug("Debug: %s", debugEnable ? "true" : "false");
 
-  ActorRef *pinger4 = actorsystem_actor_ref(system, 
-                          &Pinger, 
-                          &(PingerParams){ .maxPings = 10000 }, 
-                          sizeof(PingerParams), 
-                          true);
+  ActorRef *system = actorsystem_create(workers);
+ 
+  for (int i = 0; i < pingers; i++) {
+    pingersRef[i] = actorsystem_actor_ref(system,
+        "Pinger",
+        &Pinger, 
+        &(PingerParams){ .maxPings = pings, .debug = debugEnable }, 
+        sizeof(PingerParams), 
+        true);
+  }
 
   int result = actorsystem_wait(system);
 
-  actorref_free(pinger);
-  actorref_free(pinger2);
-  actorref_free(pinger3);
-  actorref_free(pinger4);
+  for (int i = 0; i < pingers; i++) {
+    actorref_free(pingersRef[i]);
+  }
 
   actorsystem_free(system);
 
   return result;
 }
+
