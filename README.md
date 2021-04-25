@@ -1,13 +1,18 @@
 # Actors: Actor Model in C. 
 
+
 Work in Progress...
 
 ## Building
 
-./build.sh
+bazel build demo
 
 ## Executing
 
-./actors
+bazel run demo <num-workers> <num-actors-pinger> <max-pings> <enable-debug>
+
+ex:
+
+bazel run demo 4 4 40000000 false
 
 

@@ -1,0 +1,5 @@
+build --copt='-Wall'
+build --copt='-Wpedantic'
+build --copt='-Werror'
+build --copt='-std=c17'
+build --compilation_mode=dbg
