@@ -9,7 +9,7 @@ bazel build demo
 
 ## Executing
 
-bazel run demo <num-workers> <num-actors-pinger> <max-pings> <enable-debug>
+bazel run demo \<num-workers\> \<num-actors-pinger\> \<max-pings\> \<enable-debug\>
 
 ex:
 
