@@ -33,21 +33,21 @@ void mailbox_free(MailBox *mailbox) {
 }
 
 bool mailbox_is_empty(MailBox *mailbox) {
-  // pthread_mutex_lock(&mailbox->mutex);
+  pthread_mutex_lock(&mailbox->mutex);
   bool empty = queue_is_empty(mailbox->queue);
-  // pthread_mutex_unlock(&mailbox->mutex);
+  pthread_mutex_unlock(&mailbox->mutex);
   return empty;
 }
 
 void mailbox_push(MailBox *mailbox, Msg *msg) {
-  // pthread_mutex_lock(&mailbox->mutex);
+  pthread_mutex_lock(&mailbox->mutex);
   queue_add(mailbox->queue, msg);
-  // pthread_mutex_unlock(&mailbox->mutex);
+  pthread_mutex_unlock(&mailbox->mutex);
 }
 
 Msg * mailbox_pull(MailBox *mailbox) {
-  // pthread_mutex_lock(&mailbox->mutex);
+  pthread_mutex_lock(&mailbox->mutex);
   Msg *msg = queue_get(mailbox->queue);
-  // pthread_mutex_unlock(&mailbox->mutex);
+  pthread_mutex_unlock(&mailbox->mutex);
   return msg;
 }

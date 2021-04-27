@@ -14,7 +14,7 @@ Dispatcher *dispatcher_create(int numWorkers) {
   dispatcher->numWorkers = numWorkers;
   dispatcher->currentWorker = 0;
 
-  int throughput = 10;
+  int throughput = 8;
   int throughputDeadlineNS = -1;  // not defined
 
   int numCores = sysconf(_SC_NPROCESSORS_ONLN);

@@ -5,7 +5,7 @@
 
 ACTOR(Pinger, {
   int maxPings;
-  bool debug;
+  int numPongers;
 });
 
 MSG(Ping, { int num; });
