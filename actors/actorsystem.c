@@ -27,7 +27,7 @@ void system_on_start(ActorCell *actor, Msg *msg) {
 
 bool system_on_receive(ActorCell *actor, Msg *msg) {
   if (msg->type == &Stopped) {
-    if (actors_num_children(actor) == 0) {
+    if (actors_num_children(actor) == 1) {
       debug("[System] Stopped all children!");
       return false;
     }
@@ -132,6 +132,7 @@ int actors_num_children(ActorCell *actor) {
 
 void actors_free(ActorCell *system) {
   dispatcher_free(ACTOR_SYSTEM->dispatcher);
+  actorcell_free(system);
   free(ACTOR_SYSTEM);
   debug("Actor system stopped.");
 }

@@ -119,7 +119,7 @@ bool actorcell_affinity(const ActorCell *actorCell) {
 
 void actorcell_send(ActorCell *from, ActorCell *to, const MsgType *type,
                     const void *payload) {
-  debugf("%s enviando %s para %s",
+  debugf("[send] %s >>> %s >>> %s",
          (from != NULL) ? from->name : "[main-thread]", type->name, to->name);
   Msg *msg = msg_create(from, type, payload);
   mailbox_push(to->mailbox, msg);
@@ -149,7 +149,7 @@ int actorcell_num_children(ActorCell *actorCell) {
 }
 
 bool actorcell_receive(ActorCell *actorCell, Msg *msg) {
-  debugf("[%s] actorcell_receive()", actorCell->name);
+  debugf("[receive] %s >>> %s >>> %s", (msg->from) ? msg->from->name : "[main-thread]", msg->type->name, actorCell->name);
 
   if (msg->type == &Start) {
     actorCell->actor.onStart(actorCell, msg);
@@ -159,11 +159,12 @@ bool actorcell_receive(ActorCell *actorCell, Msg *msg) {
   if (msg->type == &Stop) {
     actorcell_stop(actorCell, msg);
   } else {
+    const bool keepGoing = actorCell->actor.onReceive(actorCell, msg);
+
     if (msg->type == &Stopped) {
       actorcell_stopped(actorCell, msg);
     }
 
-    const bool keepGoing = actorCell->actor.onReceive(actorCell, msg);
     if (!keepGoing) {
       actorcell_stop(actorCell, NULL);
     }
@@ -173,8 +174,6 @@ bool actorcell_receive(ActorCell *actorCell, Msg *msg) {
     actorCell->actor.onStop(actorCell, msg);
     if (actorCell->parent != NULL) {
       actorcell_send(actorCell, actorCell->parent, &Stopped, NULL);
-    } else {
-      actorcell_free(actorCell);
     }
     return false;
   }
