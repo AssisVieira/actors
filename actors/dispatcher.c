@@ -46,14 +46,10 @@ void dispatcher_register_for_execution(Dispatcher *dispatcher,
   bool isEmpty = actorcell_is_empty(actor);
   const char *actorName = actorcell_name(actor);
 
-  debugf("Tentando agendar execução de %s [Tem msg? %s]", actorName,
-         (isEmpty) ? "false" : "true");
-
   if (!isEmpty) {
     if (actorcell_set_scheduled(actor)) {
+      debugf("[dispatcher] agendado: %s", actorName);
       dispatcher_execute(dispatcher, actor);
-    } else {
-      debugf("Não agendado, pois %s já esta agendado.", actorName);
     }
   }
 }

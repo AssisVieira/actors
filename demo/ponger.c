@@ -18,7 +18,7 @@ void ponger_on_start(ActorCell *actor, Msg *msg) { debug("Ponger started."); }
 bool ponger_on_receive(ActorCell *actor, Msg *msg) {
   if (msg->type == &Ping) {
     const PingParams *ping = msg->payload;
-    debugf("Pong %d", ping->num);
+    //debugf("Pong %d", ping->num);
     PongParams pong = {.num = ping->num};
     actors_send(actor, msg->from, &Pong, &pong);
   }

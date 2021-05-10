@@ -111,6 +111,8 @@ void *worker_run(void *arg) {
       leftThroughput--;
     }
 
+    debugf("idle: %s; keep-going: %d", actorcell_name(actor), keepGoing);
+
     if (keepGoing) {
       actorcell_set_idle(actor);
       dispatcher_register_for_execution(worker->dispatcher, actor);
