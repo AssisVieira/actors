@@ -23,6 +23,7 @@ cc_library(
     visibility = ["//visibility:public"],
     copts = [""],
     linkopts = ["-pthread"],
-    deps = []
+    deps = [],
+    linkstatic = True
 )
 

@@ -21,6 +21,7 @@ cc_library(
     srcs = glob(["*.c", "*.h"]),
     hdrs = ["foundation.h"],
     visibility = ["//visibility:public"],
-    deps = ["//standard"]
+    deps = ["//standard"],
+    linkstatic = True
 )
 
