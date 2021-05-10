@@ -44,9 +44,9 @@ bool pinger_on_receive(ActorCell *actor, Msg *msg) {
   PingerParams *params = actor->params;
 
   if (msg->type == &Pong) {
-    PongParams *pong = msg->payload;
+    //PongParams *pong = msg->payload;
 
-    debugf("Ping %d", pong->num);
+    //debugf("Ping %d", pong->num);
 
     if (state->numPings >= params->maxPings) {
       return false;
@@ -54,12 +54,24 @@ bool pinger_on_receive(ActorCell *actor, Msg *msg) {
 
     state->numPings++;
 
-    state->currPonger = (state->currPonger + 1) % params->numPongers;
+    do {
+      state->currPonger = (state->currPonger + 1) % params->numPongers;
+    } while (state->pongers[state->currPonger] == NULL);
 
     actors_send(actor, state->pongers[state->currPonger], &Ping, &(PingParams){.num = state->numPings});
+  } else if (msg->type == &Stopped) {
+    for (int i  = 0; i < params->numPongers; i++) {
+      if (state->pongers[i] == msg->from) {
+        state->pongers[i] = NULL;
+      }
+    }
   }
 
   return true;
 }
 
-void pinger_on_stop(ActorCell *actor, Msg *msg) { debug("Pinger stopped."); }
+void pinger_on_stop(ActorCell *actor, Msg *msg) { 
+  PingerState *state = actor->state;
+  free(state->pongers);
+  debug("Pinger stopped."); 
+}
