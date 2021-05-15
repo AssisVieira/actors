@@ -60,8 +60,6 @@ void worker_enqueue(Worker *worker, ActorCell *actor) {
 
   pthread_cond_signal(&worker->condNotEmpty);
 
-  debugf("Notificando %s.", worker->name);
-
   pthread_mutex_unlock(&worker->mutex);
 }
 
@@ -91,9 +89,7 @@ void *worker_run(void *arg) {
     ActorCell *actor = queue_get(worker->queue);
 
     if (actor == NULL) {
-      debug("Sem actors.");
       pthread_cond_wait(&worker->condNotEmpty, &worker->mutex);
-      debug("Fui notificado.");
     }
 
     pthread_mutex_unlock(&worker->mutex);
@@ -111,11 +107,12 @@ void *worker_run(void *arg) {
       leftThroughput--;
     }
 
-    debugf("idle: %s; keep-going: %d", actorcell_name(actor), keepGoing);
-
     if (keepGoing) {
       actorcell_set_idle(actor);
-      dispatcher_register_for_execution(worker->dispatcher, actor);
+        
+      if (!actorcell_is_empty(actor)) {
+        dispatcher_dispatch(worker->dispatcher, actor);
+      }
     }
   }
 

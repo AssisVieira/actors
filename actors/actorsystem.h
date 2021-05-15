@@ -31,4 +31,6 @@ int actors_wait_children(ActorCell *system);
 void actors_free(ActorCell *system);
 int actors_num_children(ActorCell *actor);
 
+void actors_stop_self(ActorCell *actor);
+
 #endif

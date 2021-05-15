@@ -14,7 +14,6 @@ typedef struct Dispatcher {
 
 Dispatcher *dispatcher_create(int numWorkers);
 void dispatcher_free(Dispatcher *dispatcher);
-void dispatcher_register_for_execution(Dispatcher *dispatcher, ActorCell *actor);
 void dispatcher_dispatch(Dispatcher *dispatcher, ActorCell *actor);
 void dispatcher_execute(Dispatcher *dispatcher, ActorCell *actor);
 

@@ -49,6 +49,10 @@ int actorcell_children_count(const ActorCell *actor) {
   return actor->childrenCount;
 }
 
+void actorcell_stop_self(ActorCell *actor) {
+  actor->stopSelf = true;
+}
+
 ActorCell *actorcell_create(ActorCell *parent, const char *name,
                             const Actor *actor, const void *params,
                             Dispatcher *dispatcher) {
@@ -65,6 +69,7 @@ ActorCell *actorcell_create(ActorCell *parent, const char *name,
   actorCell->childrenCount = 0;
   actorCell->stopping = false;
   actorCell->name = strdup(name);
+  actorCell->stopSelf = false;
 
   actorCell->params = calloc(1, actor->paramsSize);
 
@@ -159,13 +164,13 @@ bool actorcell_receive(ActorCell *actorCell, Msg *msg) {
   if (msg->type == &Stop) {
     actorcell_stop(actorCell, msg);
   } else {
-    const bool keepGoing = actorCell->actor.onReceive(actorCell, msg);
+    actorCell->actor.onReceive(actorCell, msg);
 
     if (msg->type == &Stopped) {
       actorcell_stopped(actorCell, msg);
     }
 
-    if (!keepGoing) {
+    if (actorCell->stopSelf) {
       actorcell_stop(actorCell, NULL);
     }
   }

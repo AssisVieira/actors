@@ -29,7 +29,8 @@ void queue_free(Queue *queue) {
 }
 
 bool queue_add(Queue *queue, void *item) {
-  if (queue == NULL || item == NULL) return false;
+  assert(queue != NULL);
+  assert(item != NULL);
   bool r = false;
   const int newWriter = (queue->writer + 1) % queue->max;
   if (newWriter != queue->reader) {

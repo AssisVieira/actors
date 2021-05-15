@@ -41,27 +41,15 @@ void dispatcher_free(Dispatcher *dispatcher) {
   free(dispatcher);
 }
 
-void dispatcher_register_for_execution(Dispatcher *dispatcher,
-                                       ActorCell *actor) {
-  bool isEmpty = actorcell_is_empty(actor);
-  const char *actorName = actorcell_name(actor);
-
-  if (!isEmpty) {
-    if (actorcell_set_scheduled(actor)) {
-      debugf("[dispatcher] agendado: %s", actorName);
-      dispatcher_execute(dispatcher, actor);
-    }
-  }
-}
-
 void dispatcher_dispatch(Dispatcher *dispatcher, ActorCell *actor) {
-  dispatcher_register_for_execution(dispatcher, actor);
+  if (actorcell_set_scheduled(actor)) {
+    dispatcher_execute(dispatcher, actor);
+  }
 }
 
 void dispatcher_execute(Dispatcher *dispatcher, ActorCell *actor) {
   int worker = actorcell_worker(actor);
   bool undefinedWorker = (worker < 0) ? true : false;
-  const char *actorName = actorcell_name(actor);
   bool affinity = actorcell_affinity(actor);
 
   if (!affinity || (affinity && undefinedWorker)) {
@@ -77,9 +65,6 @@ void dispatcher_execute(Dispatcher *dispatcher, ActorCell *actor) {
   }
 
   actorcell_set_worker(actor, worker);
-
-  debugf("%s foi agendado em %s.", actorName,
-         dispatcher->workers[worker]->name);
 
   worker_enqueue(dispatcher->workers[worker], actor);
 }

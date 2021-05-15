@@ -4,39 +4,32 @@
 
 #include "actorsystem.h"
 
+#include "actor.h"
 #include "actorcell.h"
 #include "dispatcher.h"
 #include "msg.h"
-
-static void system_on_start(ActorCell *actor, Msg *msg);
-static bool system_on_receive(ActorCell *actor, Msg *msg);
-static void system_on_stop(ActorCell *actor, Msg *msg);
 
 static void actors_sig_term_handler(int signum, siginfo_t *info, void *ptr);
 static int actors_setup_signals();
 
 static ActorSystem *ACTOR_SYSTEM = NULL;
 
-ACTOR_IMPL(
-    System, { char ignore; }, system_on_start, system_on_receive,
-    system_on_stop);
+ACTOR_IMPL(System, { char ignore; });
 
-void system_on_start(ActorCell *actor, Msg *msg) {
+ACTOR_ON_START(System, actor, params, state, msg) {
   debug("System Actor started.");
 }
 
-bool system_on_receive(ActorCell *actor, Msg *msg) {
+ACTOR_ON_RECEIVE(System, actor, params, state, msg) {
   if (msg->type == &Stopped) {
     if (actors_num_children(actor) == 1) {
       debug("[System] Stopped all children!");
-      return false;
+      actors_stop_self(actor);
     }
   }
-
-  return true;
 }
 
-void system_on_stop(ActorCell *actor, Msg *msg) {
+ACTOR_ON_STOP(System, actor, params, state, msg)  {
   pthread_mutex_lock(&ACTOR_SYSTEM->waitMutex);
   ACTOR_SYSTEM->stop = true;
   pthread_cond_signal(&ACTOR_SYSTEM->waitCond);
@@ -124,6 +117,10 @@ int actors_wait_children(ActorCell *system) {
   actors_free(system);
 
   return 0;
+}
+
+void actors_stop_self(ActorCell *actor) {
+  actorcell_stop_self(actor);
 }
 
 int actors_num_children(ActorCell *actor) {

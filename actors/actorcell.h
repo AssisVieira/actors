@@ -31,6 +31,7 @@ typedef struct ActorCell {
   atomic_bool idle;
   bool affinity;
   int worker;
+  bool stopSelf;
 } ActorCell;
 
 int actorcell_add_child(ActorCell *parent, ActorCell *child);
@@ -62,5 +63,7 @@ void actorcell_set_worker(ActorCell *actorCell, int worker);
 bool actorcell_process(ActorCell *actorCell);
 
 int actorcell_num_children(ActorCell *actorCell);
+
+void actorcell_stop_self(ActorCell *actor);
 
 #endif
