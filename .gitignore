@@ -1,3 +1,7 @@
 bazel-*
 */*.swp
 .vscode
+call-graph.png
+gmon.out
+gprof-report.txt
+graph-report.dot
